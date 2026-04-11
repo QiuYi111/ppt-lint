@@ -1,0 +1,42 @@
+# .pre-commit-config.yaml
+# The First Line of Defense
+
+repos:
+  # 1. Standard Hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+
+  # 2. Language Specific (Example: Python + Ruff)
+  # - repo: https://github.com/astral-sh/ruff-pre-commit
+  #   rev: v0.1.0
+  #   hooks:
+  #     - id: ruff
+  #     - id: ruff-format
+
+  # 3. Language Specific (Example: Go)
+  # - repo: https://github.com/golangci/golangci-lint
+  #   rev: v1.55.2
+  #   hooks:
+  #     - id: golangci-lint
+
+  # 4. Custom Policy: Enforce Tests for Domain Logic
+  #    If a file is added to `internal/domain`, a corresponding `_test` file MUST exist.
+  - repo: local
+    hooks:
+      - id: require-tests
+        name: Check for Tests
+        entry: >
+          bash -c 'for f in "$@"; do
+            if [[ "$f" == *"internal/domain"* ]] && [[ "$f" != *"_test"* ]]; then
+              # Logic to check for test file...
+              echo "⚠️  Policy: Domain logic must have tests. Please verify.";
+            fi;
+          done' --
+        language: system
+        pass_filenames: true
