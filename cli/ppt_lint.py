@@ -79,20 +79,24 @@ def check(
             dry_run=dry_run,
         )
         if dry_run and result.fixable:
-            click.echo(f"[Dry Run] Would fix {len(result.fixable)} issues")
+            click.echo(
+                f"[Dry Run] Would fix {len(result.fixable)} issues",
+                err=True,
+            )
     else:
         result = lint_file(file, compiled)
 
-    reporters = {"terminal": report_terminal, "json": report_json, "html": report_html}
-    reporter_fn = reporters.get(output, report_terminal)
-    report_content = reporter_fn(result)
-    if report_path:
-        Path(report_path).write_text(report_content, encoding="utf-8")
-
-    if output == "json":
+    if output == "terminal":
+        report_terminal(result)
+    elif output == "json":
+        report_content = report_json(result)
         click.echo(report_content)
-    elif output == "html" and not report_path:
-        click.echo("HTML report generated. Use --report <file> to save.")
+    elif output == "html":
+        report_content = report_html(result)
+        if report_path:
+            Path(report_path).write_text(report_content, encoding="utf-8")
+        else:
+            click.echo("HTML report generated. Use --report <file> to save.")
 
     # Exit code
     if result.errors:
