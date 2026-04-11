@@ -1,0 +1,64 @@
+# ppt-lint 规则配置文件
+# 示例：导师组规范
+
+meta:
+  name: "导师组规范 v1"
+  version: "1.0"
+
+# ── 字体规则 ──────────────────────────────────────────
+fonts:
+  title:
+    family: "微软雅黑"
+    size_pt: 28
+    bold: true
+    color: "#1F2D3D"
+  body:
+    family: "微软雅黑"
+    size_pt: 14
+    bold: false
+    color: "#333333"
+  caption:
+    family: "微软雅黑"
+    size_pt: 10
+    color: "#666666"
+
+# ── 颜色规则 ──────────────────────────────────────────
+colors:
+  allowed_text: ["#1F2D3D", "#333333", "#666666", "#FFFFFF"]
+  allowed_background: ["#FFFFFF", "#F5F5F5", "#1F2D3D"]
+  accent: "#2B7FE1"
+
+# ── 对齐规则 ──────────────────────────────────────────
+alignment:
+  title: "left"
+  body: "left"
+  slide_number: "right"
+
+# ── 间距规则 ──────────────────────────────────────────
+spacing:
+  content_margin_pt: 36
+  line_spacing: 1.2
+
+# ── 页码规则 ──────────────────────────────────────────
+slide_number:
+  visible: true
+  position: "bottom_right"
+  font_size_pt: 10
+
+# ── 图表规则 ──────────────────────────────────────────
+charts:
+  require_title: true
+  title_font_size_pt: 12
+  require_axis_labels: true
+
+# ── AI 规则（复杂/模糊，无法用基元表达）────────────────
+ai_rules:
+  - id: "no_orphan_text"
+    description: "每张 slide 的正文文字块不应该只有一行孤行，至少要有两行或者干脆没有"
+    severity: warning
+  - id: "consistent_bullet_style"
+    description: "同一张 slide 内，所有 bullet point 的缩进层级和符号风格必须一致，不能混用实心圆点和短横线"
+    severity: error
+  - id: "figure_has_caption"
+    description: "每张图片下方或上方必须有一个文字框作为图注，图注以'图X.'或'Figure X.'开头"
+    severity: warning

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ppt-lint"
@@ -26,10 +26,10 @@ dev = [
 ]
 
 [project.scripts]
-ppt-lint = "cmd.ppt_lint:cli"
+ppt-lint = "cli.ppt_lint:cli"
 
 [tool.setuptools.packages.find]
-include = ["cmd*", "internal*"]
+include = ["cli*", "internal*"]
 
 [tool.ruff]
 line-length = 100
