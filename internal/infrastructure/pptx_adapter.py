@@ -171,6 +171,78 @@ def get_slide_number_shapes(slide: Any) -> list[dict[str, Any]]:
     return candidates
 
 
+def extract_slide_summary(slide: Any, slide_index: int) -> dict[str, Any]:
+    """Extract a structured summary of all shapes on a slide for AI classification.
+
+    Returns a dict with slide dimensions and a list of shape descriptors
+    suitable for sending to Claude for role classification.
+    """
+    slide_w = 9144000  # default 10 inches in EMU
+    slide_h = 6858000  # default 7.5 inches
+    try:
+        slide_w = slide.slide_layout.slide_master.slide_width
+        slide_h = slide.slide_layout.slide_master.slide_height
+    except (AttributeError, TypeError):
+        pass
+
+    shapes = []
+    for si, shape in enumerate(slide.shapes):
+        entry: dict[str, Any] = {
+            "index": si,
+            "name": shape.name,
+            "type": str(shape.shape_type),
+            "has_text": shape.has_text_frame,
+        }
+
+        if shape.has_text_frame:
+            tf = shape.text_frame
+            entry["text_preview"] = tf.text[:120]
+            entry["paragraph_count"] = len(tf.paragraphs)
+            # Collect font info from first run
+            if tf.paragraphs and tf.paragraphs[0].runs:
+                first_run = tf.paragraphs[0].runs[0]
+                entry["font_name"] = first_run.font.name
+                entry["font_size_pt"] = (
+                    _emu_to_pt(first_run.font.size) if first_run.font.size else None
+                )
+                entry["bold"] = first_run.font.bold
+                entry["color_hex"] = rgb_to_hex_safe(first_run.font.color)
+            # Max font size across all runs
+            entry["max_font_size_pt"] = _get_max_font_size(shape)
+        else:
+            entry["has_fill"] = False
+            try:
+                if shape.fill and shape.fill.type is not None:
+                    entry["has_fill"] = True
+                    entry["fill_color"] = rgb_to_hex_safe(shape.fill.fore_color)
+            except Exception:
+                pass
+
+        # Position in inches (approximate)
+        if hasattr(shape, "left"):
+            entry["left_in"] = round(float(shape.left) / 914400, 2)
+            entry["top_in"] = round(float(shape.top) / 914400, 2)
+            entry["width_in"] = round(float(shape.width) / 914400, 2)
+            entry["height_in"] = round(float(shape.height) / 914400, 2)
+
+        # Placeholder info
+        if hasattr(shape, "is_placeholder") and shape.is_placeholder:
+            ph_fmt = getattr(shape, "placeholder_format", None)
+            if ph_fmt and hasattr(ph_fmt, "idx"):
+                entry["placeholder_idx"] = ph_fmt.idx
+            if ph_fmt and hasattr(ph_fmt, "type"):
+                entry["placeholder_type"] = str(ph_fmt.type)
+
+        shapes.append(entry)
+
+    return {
+        "slide_index": slide_index,
+        "slide_width_in": round(float(slide_w) / 914400, 2),
+        "slide_height_in": round(float(slide_h) / 914400, 2),
+        "shapes": shapes,
+    }
+
+
 def get_chart_shapes(slide: Any) -> list[dict[str, Any]]:
     """Get all chart shapes on a slide."""
     charts = []

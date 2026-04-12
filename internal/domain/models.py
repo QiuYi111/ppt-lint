@@ -126,3 +126,4 @@ class CompiledRuleSet:
     """Set of compiled checker functions ready to run against slides."""
 
     checkers: list[Callable] = field(default_factory=list)
+    user_roles: list[str] = field(default_factory=list)  # role names for AI classifier

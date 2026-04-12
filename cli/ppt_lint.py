@@ -77,6 +77,7 @@ def check(
             compiled,
             output_path=output_file,
             dry_run=dry_run,
+            use_ai=not no_ai,
         )
         if dry_run and result.fixable:
             click.echo(
@@ -84,7 +85,7 @@ def check(
                 err=True,
             )
     else:
-        result = lint_file(file, compiled)
+        result = lint_file(file, compiled, use_ai=not no_ai)
 
     if output == "terminal":
         report_terminal(result)
