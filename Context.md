@@ -5,10 +5,10 @@ Update this file as work progresses.
 
 ## Current State
 
-- Status: Core implementation complete, false positive reduction applied
+- Status: AI-powered role classification implemented, ready for validation
 - Last updated: 2026-04-12
 - Branch: feat/ppt-lint-core
-- Latest commit: d3ad382
+- Latest commit: 83160f4
 
 ## Key Findings
 
@@ -17,7 +17,7 @@ Update this file as work progresses.
 - Setuptools editable install needs explicit package include for `cli*`
 - `report_terminal` (rich console.print) pollutes JSON output — must only call when format is "terminal"
 - Dry-run messages must go to stderr, not stdout, to avoid corrupting piped JSON
-- Template PPTs generate ~833 false positives: decorative shapes misclassified as backgrounds, body text includes separators/headers/footers, page number format "N / M" not recognized (PER-67)
+- **Heuristic classifiers are fundamentally limited** — every new template introduces edge cases. AI classification is the correct solution (PER-67 user feedback).
 
 ## Architecture Decisions
 
@@ -26,28 +26,44 @@ Update this file as work progresses.
 - AI rules compiled via Claude API, cached in `.ppt-lint-cache/`
 - Test fixtures created programmatically via python-pptx
 - Output format dispatch in CLI: only call report_terminal for terminal mode
-- **Role classifier uses multi-signal heuristic**: shape name → placeholder index → content/position → font size. Maps to user-defined roles when available.
-- **Background color checks slide.background.fill**, not individual shape fills (decorative shapes are not slide backgrounds)
-- **Slide number regex** supports both plain digits and "N / M" format
+- **Role classification: Claude CLI first, heuristic fallback**
+  - `role_classifier.py` calls `claude --print --bare --output-format json` per slide
+  - Shape metadata (text, font, position, placeholder type, name) serialized via `extract_slide_summary()`
+  - Per-slide content-hash caching in `.ppt-lint-cache/roles/`
+  - Engine computes role_map once/slide, passes to all checkers via `role_map` kwarg
+  - Backward compatible: TypeError fallback for legacy checkers
+- **Background color checks slide.background.fill**, not individual shape fills
+- **Slide number regex** supports plain digits and "N / M" format
+
+## Claude CLI Integration (role_classifier.py)
+
+- `claude --print --bare --model claude-sonnet-4-20250514 --output-format json --dangerously-skip-permissions`
+- `--bare` mode reduces system prompt (~44K vs 64K without)
+- Cost: ~$0.015/slide with cache read, ~$0.20 cold (first call)
+- Timeout: 45s per slide
+- Response parsing: `{"type": "result", "result": "<json>"}` — strips markdown fences
+- Fallback: heuristic classifier when Claude unavailable or times out
+- `--no-ai` flag disables AI entirely (tests, CI, offline use)
 
 ## Test Results
 
-- **pytest**: 28/28 passed
+- **pytest**: 28/28 passed (all use `use_ai=False`)
 - **ruff**: all checks passed
-- **E2E manual tests**: all 8 scenarios passed
-  - `bad.pptx`: 9 issues (3E/6W), 5 fixable
-  - `good.pptx`: 0 issues, passed
-  - `--fix --dry-run`: file unchanged
-  - `--fix`: 9 → 2 issues (only non-fixable warnings remain)
-  - HTML report: valid, self-contained
-  - JSON output: clean, no pollution
+- **AI classification verified**: Claude correctly classifies title/body shapes on test PPT
+- **E2E manual tests**: all 8 scenarios passed (with `--no-ai`)
 
-## PER-67 Fix Details (2026-04-12)
+## PER-67 Fix History (2026-04-12)
 
-Three root causes addressed:
-1. **P0 - Role classifier** (`classify_text_role`): Complete rewrite with 6-signal heuristic. Placeholder idx >= 10 → footer/slide_number. Font >= 40pt → section_number. Bottom area + small text → footer. Top area requires font > 14pt for title. User-defined roles supported.
-2. **P1 - Background color** (`get_slide_background_color`): New function checks `slide.background.fill` instead of all shape fills. Eliminates ~308 false positives from decorative shapes (purple sidebars, card backgrounds, etc.)
-3. **P2 - Page number regex**: Both `get_slide_number_shapes()` and `classify_text_role()` now match `^\d+\s*/\s*\d+$` (e.g. "4 / 13").
+### Commit d3ad382 — Heuristic improvements (still limited)
+1. Role classifier rewrite with 6-signal heuristic
+2. Background color: `get_slide_background_color()` checks slide background
+3. Page number regex: "N / M" format support
+
+### Commit 83160f4 — AI-powered classification (proper fix)
+- New `role_classifier.py` with Claude CLI integration
+- Engine refactored: role_map computed once per slide, passed to checkers
+- Heuristic classifier retained as fallback
+- `--no-ai` CLI flag for offline/CI mode
 
 ## GitHub Setup
 
@@ -57,6 +73,7 @@ Three root causes addressed:
 
 ## Remaining Work
 
+- [ ] Validate against real template PPT (midterm_fixed.pptx) — measure false positive reduction from 833
 - [ ] AI rule compilation end-to-end test (requires ANTHROPIC_API_KEY)
 - [ ] Content margin checking (spacing.content_margin_pt)
 - [ ] Slide number position checking
@@ -64,4 +81,4 @@ Three root causes addressed:
 - [ ] More edge case tests (empty slides, corrupt files)
 - [ ] Create PR from feat/ppt-lint-core to main
 - [ ] User review and merge
-- [ ] Validate fix against real template PPT (midterm_fixed.pptx) to measure false positive reduction
+- [ ] Consider batch mode: classify all slides in one Claude call for large PPTs (cost optimization)
