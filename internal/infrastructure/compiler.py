@@ -29,7 +29,7 @@ from .pptx_adapter import (
     apply_line_spacing_fix,
     classify_text_role,
     get_chart_shapes,
-    get_shapes_with_fill,
+    get_slide_background_color,
     get_slide_number_shapes,
     get_text_runs,
     hex_to_rgb,
@@ -43,11 +43,12 @@ CACHE_DIR = Path(".ppt-lint-cache")
 def compile_rules(rules: RuleSet, use_ai: bool = True) -> CompiledRuleSet:
     """Compile a RuleSet into a CompiledRuleSet of checker functions."""
     checkers: list[Callable] = []
+    user_roles = set(rules.fonts.keys()) if rules.fonts else None
 
     # Primitive rules
-    checkers.extend(_compile_font_rules(rules))
+    checkers.extend(_compile_font_rules(rules, user_roles))
     checkers.extend(_compile_color_rules(rules))
-    checkers.extend(_compile_alignment_rules(rules))
+    checkers.extend(_compile_alignment_rules(rules, user_roles))
     checkers.extend(_compile_spacing_rules(rules))
     checkers.extend(_compile_slide_number_rules(rules))
     checkers.extend(_compile_chart_rules(rules))
@@ -61,20 +62,20 @@ def compile_rules(rules: RuleSet, use_ai: bool = True) -> CompiledRuleSet:
 
 # ── Font Rules ──────────────────────────────────────────
 
-def _compile_font_rules(rules: RuleSet) -> list[Callable]:
+def _compile_font_rules(rules: RuleSet, user_roles: set[str] | None = None) -> list[Callable]:
     checkers = []
     for role, font_rule in rules.fonts.items():
         if any([font_rule.family, font_rule.size_pt, font_rule.bold is not None, font_rule.color]):
-            checkers.append(_make_font_checker(role, font_rule))
+            checkers.append(_make_font_checker(role, font_rule, user_roles))
     return checkers
 
 
-def _make_font_checker(role: str, fr: FontRule) -> Callable:
+def _make_font_checker(role: str, fr: FontRule, user_roles: set[str] | None = None) -> Callable:
     def check(slide: Any, slide_index: int) -> list[LintIssue]:
         issues = []
         for run_info in get_text_runs(slide):
             text_role = classify_text_role(
-                slide.shapes[run_info["shape_index"]], slide
+                slide.shapes[run_info["shape_index"]], slide, user_roles
             )
             if text_role != role:
                 continue
@@ -198,52 +199,58 @@ def _make_bg_color_checker(allowed: list[str]) -> Callable:
 
     def check(slide: Any, slide_index: int) -> list[LintIssue]:
         issues = []
-        for shape_info in get_shapes_with_fill(slide):
-            color_clean = shape_info["fill_color"].upper().lstrip("#")
+        # Check the slide's own background color, not decorative shape fills
+        bg_color = get_slide_background_color(slide)
+        if bg_color:
+            color_clean = bg_color.upper().lstrip("#")
             if color_clean not in allowed_upper:
-                desc = f"形状 \"{shape_info['shape_name']}\""
-                fix = FixAction(
-                    f"修正 {desc} 的背景色为第一个允许色",
-                    lambda s=slide, si=shape_info["shape_index"], c=allowed[0]:
-                        _set_fill_color(s.shapes[si], c)
-                )
                 issues.append(LintIssue(
                     rule_id="colors.allowed_background",
                     severity=Severity.WARNING,
                     slide_index=slide_index,
-                    element_desc=desc,
-                    message=f"背景色 '{shape_info['fill_color']}' 不在允许列表中",
-                    fix=fix,
+                    element_desc="幻灯片背景",
+                    message=f"背景色 '{bg_color}' 不在允许列表中",
+                    fix=FixAction(
+                        "修正幻灯片背景色为第一个允许色",
+                        lambda s=slide, c=allowed[0]: _set_slide_bg_color(s, c),
+                    ),
                 ))
         return issues
 
     return check
 
 
-def _set_fill_color(shape: Any, hex_color: str) -> None:
-    """Set shape fill color."""
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = hex_to_rgb(hex_color)
+def _set_slide_bg_color(slide: Any, hex_color: str) -> None:
+    """Set slide background color."""
+    try:
+        bg = slide.background
+        fill = bg.fill
+        fill.solid()
+        fill.fore_color.rgb = hex_to_rgb(hex_color)
+    except (AttributeError, TypeError):
+        pass
 
 
 # ── Alignment Rules ──────────────────────────────────────
 
-def _compile_alignment_rules(rules: RuleSet) -> list[Callable]:
+def _compile_alignment_rules(rules: RuleSet, user_roles: set[str] | None = None) -> list[Callable]:
     checkers = []
     ar = rules.alignment
     if ar.title:
-        checkers.append(_make_alignment_checker("title", ar.title))
+        checkers.append(_make_alignment_checker("title", ar.title, user_roles))
     if ar.body:
-        checkers.append(_make_alignment_checker("body", ar.body))
+        checkers.append(_make_alignment_checker("body", ar.body, user_roles))
     return checkers
 
 
-def _make_alignment_checker(role: str, expected_align: str) -> Callable:
+def _make_alignment_checker(
+    role: str, expected_align: str, user_roles: set[str] | None = None,
+) -> Callable:
     def check(slide: Any, slide_index: int) -> list[LintIssue]:
         issues = []
         for run_info in get_text_runs(slide):
             text_role = classify_text_role(
-                slide.shapes[run_info["shape_index"]], slide
+                slide.shapes[run_info["shape_index"]], slide, user_roles
             )
             if text_role != role:
                 continue
