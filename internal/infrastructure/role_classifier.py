@@ -1,7 +1,11 @@
 """AI-powered text role classifier using Claude CLI.
 
 Instead of brittle heuristics, sends slide shape metadata to Claude
-for intelligent role classification. Results are cached per slide content.
+for intelligent role classification. Supports two modes:
+  - Batch (default): all slides classified in one Claude call
+  - Per-slide fallback: one call per slide (for cache hits / retries)
+
+Results are cached per slide content hash.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from pptx import Presentation
+
 from .pptx_adapter import classify_text_role, extract_slide_summary
 
 logger = logging.getLogger(__name__)
@@ -23,7 +29,42 @@ CACHE_DIR = Path(".ppt-lint-cache/roles")
 # Claude CLI config
 _CLAUDE_CMD = "claude"
 _CLAUDE_MODEL = "claude-sonnet-4-20250514"
-_CLAUDE_TIMEOUT = 45  # seconds
+_CLAUDE_TIMEOUT = 120  # seconds per call
+
+
+def classify_all_slides(
+    prs: Presentation,
+    user_roles: set[str] | None = None,
+    use_ai: bool = True,
+) -> dict[int, dict[int, str]]:
+    """Classify text shapes on all slides.
+
+    Returns dict mapping slide_index → {shape_index → role_name}.
+    """
+    n_slides = len(prs.slides)
+    result: dict[int, dict[int, str]] = {}
+
+    if not use_ai or not _claude_available():
+        for i, slide in enumerate(prs.slides):
+            result[i] = _classify_heuristic(slide, user_roles)
+        return result
+
+    # Try batch mode first: one Claude call for all slides
+    batch_result = _classify_batch(prs, user_roles)
+    if batch_result is not None:
+        # Fill in any slides that batch missed (e.g. no text shapes)
+        for i in range(n_slides):
+            if i in batch_result:
+                result[i] = batch_result[i]
+            else:
+                result[i] = _classify_heuristic(prs.slides[i], user_roles)
+        return result
+
+    # Fallback: per-slide calls
+    logger.warning("Batch classification failed, falling back to per-slide")
+    for i, slide in enumerate(prs.slides):
+        result[i] = classify_slide_roles(slide, i, user_roles, use_ai=True)
+    return result
 
 
 def classify_slide_roles(
@@ -32,16 +73,24 @@ def classify_slide_roles(
     user_roles: set[str] | None = None,
     use_ai: bool = True,
 ) -> dict[int, str]:
-    """Classify all text shapes on a slide into roles.
-
-    If use_ai is True and claude CLI is available, uses Claude for
-    intelligent classification. Falls back to heuristic classifier
-    if Claude is unavailable or use_ai is False.
+    """Classify all text shapes on a single slide into roles.
 
     Returns a dict mapping shape_index → role_name.
     """
     if not use_ai:
         return _classify_heuristic(slide, user_roles)
+
+    # Check per-slide cache first
+    summary = extract_slide_summary(slide, slide_index)
+    text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+    if not text_shapes:
+        return {}
+
+    cache_key = _slide_content_hash(text_shapes, user_roles)
+    cached = _load_cache(cache_key)
+    if cached is not None:
+        logger.debug(f"Role cache hit for slide {slide_index}")
+        return cached
 
     result = _classify_via_claude(slide, slide_index, user_roles)
     if result is not None:
@@ -70,12 +119,197 @@ def _claude_available() -> bool:
     return shutil.which(_CLAUDE_CMD) is not None
 
 
+def _classify_batch(
+    prs: Presentation,
+    user_roles: set[str] | None = None,
+) -> dict[int, dict[int, str]] | None:
+    """Classify all slides in one Claude call. Much faster than per-slide."""
+    roles_list = sorted(user_roles) if user_roles else [
+        "title", "subtitle", "body", "caption",
+        "section_number", "section_title", "slide_number", "footer",
+    ]
+
+    # Build batch payload
+    slides_data: list[dict[str, Any]] = []
+    slides_with_text = []
+
+    for i, slide in enumerate(prs.slides):
+        summary = extract_slide_summary(slide, i)
+        text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+        if not text_shapes:
+            continue
+
+        slides_with_text.append(i)
+
+        # Check per-slide cache — skip cached slides in batch
+        cache_key = _slide_content_hash(text_shapes, user_roles)
+        cached = _load_cache(cache_key)
+        if cached is not None:
+            continue  # will be filled from cache later
+
+        # Compact shape representation for the prompt
+        compact = []
+        for s in text_shapes:
+            entry: dict[str, Any] = {
+                "i": s["index"],
+                "n": s["name"],
+            }
+            if s.get("text_preview"):
+                entry["t"] = s["text_preview"][:80]
+            if s.get("max_font_size_pt") is not None:
+                entry["fs"] = s["max_font_size_pt"]
+            if s.get("left_in") is not None:
+                entry["x"] = s["left_in"]
+                entry["y"] = s["top_in"]
+            if s.get("placeholder_idx") is not None:
+                entry["ph"] = s["placeholder_idx"]
+            compact.append(entry)
+
+        slides_data.append({
+            "slide": i,
+            "w": summary["slide_width_in"],
+            "h": summary["slide_height_in"],
+            "shapes": compact,
+        })
+
+    if not slides_data:
+        # All slides cached
+        result: dict[int, dict[int, str]] = {}
+        for i in slides_with_text:
+            summary = extract_slide_summary(prs.slides[i], i)
+            text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+            cache_key = _slide_content_hash(text_shapes, user_roles)
+            cached = _load_cache(cache_key)
+            if cached is not None:
+                result[i] = cached
+        return result
+
+    # Build prompt
+    payload = json.dumps(slides_data, ensure_ascii=False, indent=1)
+    n_shapes = sum(len(s["shapes"]) for s in slides_data)
+
+    prompt = (
+        "You are a PPT layout expert. Classify every text shape into ONE role.\n\n"
+        f"Roles: {roles_list}\n\n"
+        f"Input: {len(slides_data)} slides, {n_shapes} text shapes total.\n"
+        "Each slide has: slide number, dimensions (w/h inches), shapes array.\n"
+        "Each shape has: i=index, n=name, t=text preview, fs=max font size pt, "
+        "x/y=position inches, ph=placeholder index.\n\n"
+        "Rules:\n"
+        "- Large decorative numbers (>=40pt, short text) on divider slides → section_number\n"
+        "- Page numbers (e.g. '4 / 13', '2 / 25') → slide_number\n"
+        "- Headers/footers (institution, date, small text at edges) → footer\n"
+        "- Main heading of a content slide → title\n"
+        "- Secondary/sub heading → section_title\n"
+        "- Content text, bullet points, TOC entries → body\n"
+        "- Figure captions, small annotations near images → caption\n"
+        "- Author info, affiliation → footer\n"
+        "- Unclear → body\n\n"
+        f"Data:\n{payload}\n\n"
+        'Return ONLY a JSON object: {"slide_index": {"shape_index": "role", ...}, ...}\n'
+        "No explanation. No markdown fences."
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                _CLAUDE_CMD, "--print",
+                "--bare",
+                "--model", _CLAUDE_MODEL,
+                "--output-format", "json",
+                "--dangerously-skip-permissions",
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_TIMEOUT,
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Claude CLI batch failed: {result.stderr[:300]}")
+            return None
+
+        output = json.loads(result.stdout)
+        content = output.get("result", "")
+
+        if output.get("subtype") == "error_max_budget_usd":
+            logger.warning("Claude batch: budget exceeded")
+            return None
+
+        if not content:
+            logger.warning("Claude batch: empty response")
+            return None
+
+        # Strip markdown fences
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+
+        batch_map: dict[str, dict[str, str]] = json.loads(content)
+
+        # Parse and cache per-slide results
+        all_result: dict[int, dict[int, str]] = {}
+
+        # Fill cached slides first
+        for i in slides_with_text:
+            summary = extract_slide_summary(prs.slides[i], i)
+            text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+            cache_key = _slide_content_hash(text_shapes, user_roles)
+            cached = _load_cache(cache_key)
+            if cached is not None:
+                all_result[i] = cached
+
+        # Fill batch results
+        roles_set = set(roles_list)
+        for slide_key, shape_roles in batch_map.items():
+            try:
+                si = int(slide_key)
+            except (ValueError, TypeError):
+                continue
+            parsed: dict[int, str] = {}
+            for shape_key, role in shape_roles.items():
+                try:
+                    idx = int(shape_key)
+                except (ValueError, TypeError):
+                    continue
+                if role in roles_set:
+                    parsed[idx] = role
+                else:
+                    parsed[idx] = "body"
+            all_result[si] = parsed
+            # Cache this slide
+            summary = extract_slide_summary(prs.slides[si], si)
+            text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+            cache_key = _slide_content_hash(text_shapes, user_roles)
+            _save_cache(cache_key, parsed)
+
+        classified_slides = len(all_result)
+        classified_shapes = sum(len(v) for v in all_result.values())
+        logger.info(
+            f"Claude batch: classified {classified_shapes} shapes "
+            f"across {classified_slides} slides"
+        )
+        return all_result
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Claude batch timed out ({_CLAUDE_TIMEOUT}s)")
+        return None
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.warning(f"Claude batch parse error: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Claude batch error: {e}")
+        return None
+
+
 def _classify_via_claude(
     slide: Any,
     slide_index: int,
     user_roles: set[str] | None = None,
 ) -> dict[int, str] | None:
-    """Classify shapes using Claude CLI."""
+    """Classify shapes on a single slide using Claude CLI (per-slide fallback)."""
     if not _claude_available():
         return None
 
@@ -84,42 +318,49 @@ def _classify_via_claude(
     if not text_shapes:
         return {}
 
-    # Check cache
     cache_key = _slide_content_hash(text_shapes, user_roles)
     cached = _load_cache(cache_key)
     if cached is not None:
         logger.debug(f"Role cache hit for slide {slide_index}")
         return cached
 
-    # Build prompt
     roles_list = sorted(user_roles) if user_roles else [
         "title", "subtitle", "body", "caption",
         "section_number", "section_title", "slide_number", "footer",
     ]
 
-    shapes_desc = json.dumps(text_shapes, ensure_ascii=False, indent=2)
+    # Compact representation
+    compact = []
+    for s in text_shapes:
+        entry: dict[str, Any] = {"i": s["index"], "n": s["name"]}
+        if s.get("text_preview"):
+            entry["t"] = s["text_preview"][:80]
+        if s.get("max_font_size_pt") is not None:
+            entry["fs"] = s["max_font_size_pt"]
+        if s.get("left_in") is not None:
+            entry["x"] = s["left_in"]
+            entry["y"] = s["top_in"]
+        if s.get("placeholder_idx") is not None:
+            entry["ph"] = s["placeholder_idx"]
+        compact.append(entry)
+
+    shapes_desc = json.dumps(compact, ensure_ascii=False, indent=1)
 
     prompt = (
-        "You are a PPT layout analysis expert. Classify each text shape "
-        "into exactly ONE role.\n\n"
-        f"Available roles: {roles_list}\n\n"
-        f"Slide: {summary['slide_width_in']}\" × {summary['slide_height_in']}\"\n\n"
+        "Classify each text shape into ONE role.\n"
+        f"Roles: {roles_list}\n"
+        f"Slide: {summary['slide_width_in']}\"×{summary['slide_height_in']}\"\n"
         f"Shapes:\n{shapes_desc}\n\n"
-        "Classification rules:\n"
-        "- Decorative large numbers on divider slides (e.g. \"01\", \"02\") → section_number\n"
-        "- Page numbers (e.g. \"4 / 13\") → slide_number\n"
-        "- Headers/footers (institution name, date, small text at edges) → footer\n"
-        "- Main slide heading → title\n"
+        "- Large decorative numbers (>=40pt) → section_number\n"
+        "- Page numbers ('4 / 13') → slide_number\n"
+        "- Headers/footers → footer\n"
+        "- Main heading → title\n"
         "- Sub-heading → section_title\n"
-        "- Content paragraphs → body\n"
-        "- Figure captions, small annotations → caption\n"
-        "- Author info, affiliations → footer\n"
-        "- TOC entries → body\n"
-        "- If unclear, use \"body\"\n"
-        "- Consider ALL clues: font size, position, text content, placeholder type, name\n\n"
-        "Return ONLY a JSON object mapping shape index (string) to role (string).\n"
-        "No explanation, no markdown fences. Example:\n"
-        '{"0": "title", "1": "body", "3": "slide_number"}'
+        "- Content → body\n"
+        "- Captions → caption\n"
+        "- Unclear → body\n\n"
+        'Return JSON only: {"0": "title", "1": "body"}\n'
+        "No explanation, no fences."
     )
 
     try:
@@ -144,21 +385,14 @@ def _classify_via_claude(
             )
             return None
 
-        # Parse Claude's JSON output: {"type": "result", "result": "..."}
         output = json.loads(result.stdout)
         content = output.get("result", "")
 
         if output.get("subtype") == "error_max_budget_usd":
-            logger.warning(
-                f"Claude budget exceeded for slide {slide_index}"
-            )
             return None
-
         if not content:
-            logger.warning(f"Empty Claude response for slide {slide_index}")
             return None
 
-        # Claude wraps in markdown fences even when asked not to
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -167,41 +401,30 @@ def _classify_via_claude(
 
         role_map = json.loads(content)
 
-        # Convert string keys to int, validate roles
         parsed: dict[int, str] = {}
+        roles_set = set(roles_list)
         for k, v in role_map.items():
             try:
                 idx = int(k)
-                if isinstance(v, str) and v in roles_list:
-                    parsed[idx] = v
-                else:
-                    logger.debug(
-                        f"Slide {slide_index}: unknown role '{v}' "
-                        f"for shape {idx}, using 'body'"
-                    )
-                    parsed[idx] = "body"
+                parsed[idx] = v if v in roles_set else "body"
             except (ValueError, TypeError):
                 continue
 
         _save_cache(cache_key, parsed)
-        logger.info(
-            f"Claude classified {len(parsed)} shapes on slide {slide_index}"
-        )
+        logger.info(f"Claude classified {len(parsed)} shapes on slide {slide_index}")
         return parsed
 
     except subprocess.TimeoutExpired:
         logger.warning(f"Claude CLI timed out for slide {slide_index}")
         return None
     except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(
-            f"Failed to parse Claude output for slide {slide_index}: {e}"
-        )
+        logger.warning(f"Parse error for slide {slide_index}: {e}")
         return None
     except FileNotFoundError:
         logger.warning("claude CLI not found")
         return None
     except Exception as e:
-        logger.warning(f"Claude classification error for slide {slide_index}: {e}")
+        logger.warning(f"Claude error for slide {slide_index}: {e}")
         return None
 
 

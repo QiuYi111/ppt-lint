@@ -1,8 +1,8 @@
 """Lint engine — runs compiled rules against a presentation.
 
 Supports AI-powered role classification via Claude CLI.
-Role maps are computed per-slide and passed to all checkers,
-so classification happens once per slide instead of per text run.
+Role maps are computed per-slide (batch or one-by-one) and passed
+to all checkers, so classification happens once per shape.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pptx import Presentation
 
 from internal.domain.models import CompiledRuleSet, LintIssue, Severity
 
-from .role_classifier import classify_slide_roles
+from .role_classifier import classify_all_slides
 
 logger = logging.getLogger(__name__)
 
@@ -56,23 +56,20 @@ def lint_file(
     compiled_rules: CompiledRuleSet,
     use_ai: bool = True,
 ) -> LintResult:
-    """Lint a PPTX file using compiled rules.
-
-    If use_ai is True, uses Claude CLI for intelligent role classification.
-    """
+    """Lint a PPTX file using compiled rules."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
     prs = Presentation(str(path))
     user_roles = set(compiled_rules.user_roles) if compiled_rules.user_roles else None
-    all_issues: list[LintIssue] = []
 
+    # Classify roles for all slides upfront (batch AI or heuristic)
+    all_roles = classify_all_slides(prs, user_roles, use_ai=use_ai)
+
+    all_issues: list[LintIssue] = []
     for slide_index, slide in enumerate(prs.slides):
-        # Classify roles once per slide
-        role_map = classify_slide_roles(
-            slide, slide_index, user_roles, use_ai=use_ai,
-        )
+        role_map = all_roles.get(slide_index, {})
 
         for checker in compiled_rules.checkers:
             try:
@@ -80,15 +77,12 @@ def lint_file(
                 if issues:
                     all_issues.extend(issues)
             except TypeError:
-                # Legacy checkers that don't accept role_map
                 try:
                     issues = checker(slide, slide_index)
                     if issues:
                         all_issues.extend(issues)
                 except Exception as e:
-                    logger.error(
-                        f"Error running checker on slide {slide_index}: {e}"
-                    )
+                    logger.error(f"Error running checker on slide {slide_index}: {e}")
             except Exception as e:
                 logger.error(f"Error running checker on slide {slide_index}: {e}")
 
@@ -102,24 +96,20 @@ def fix_file(
     dry_run: bool = False,
     use_ai: bool = True,
 ) -> LintResult:
-    """Lint and fix a PPTX file.
-
-    If dry_run is True, only reports what would be fixed without modifying the file.
-    """
+    """Lint and fix a PPTX file."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
     prs = Presentation(str(path))
     user_roles = set(compiled_rules.user_roles) if compiled_rules.user_roles else None
+    all_roles = classify_all_slides(prs, user_roles, use_ai=use_ai)
 
     all_issues: list[LintIssue] = []
     fix_actions: list[tuple[int, object, object]] = []
 
     for slide_index, slide in enumerate(prs.slides):
-        role_map = classify_slide_roles(
-            slide, slide_index, user_roles, use_ai=use_ai,
-        )
+        role_map = all_roles.get(slide_index, {})
 
         for checker in compiled_rules.checkers:
             try:
@@ -128,12 +118,10 @@ def fix_file(
                 try:
                     issues = checker(slide, slide_index)
                 except Exception as e:
-                    logger.error(
-                        f"Error running checker on slide {slide_index}: {e}"
-                    )
+                    logger.error(f"Error on slide {slide_index}: {e}")
                     continue
             except Exception as e:
-                logger.error(f"Error running checker on slide {slide_index}: {e}")
+                logger.error(f"Error on slide {slide_index}: {e}")
                 continue
 
             for issue in issues:
