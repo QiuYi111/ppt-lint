@@ -69,6 +69,7 @@ def _parse_rule_dict(data: dict[str, Any]) -> RuleSet:
             allowed_text=[str(c) for c in colors_raw.get("allowed_text", [])],
             allowed_background=[str(c) for c in colors_raw.get("allowed_background", [])],
             accent=colors_raw.get("accent"),
+            text_mode=str(colors_raw.get("text_mode", "whitelist")),
         )
 
     # Alignment

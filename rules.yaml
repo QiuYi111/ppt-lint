@@ -24,6 +24,9 @@ fonts:
 
 # ── 颜色规则 ──────────────────────────────────────────
 colors:
+  # text_mode: "whitelist" (exact color match) or "contrast" (WCAG contrast ratio)
+  # Use "contrast" for templates with many decorative colors
+  text_mode: "contrast"
   allowed_text: ["#1F2D3D", "#333333", "#666666", "#FFFFFF"]
   allowed_background: ["#FFFFFF", "#F5F5F5", "#1F2D3D"]
   accent: "#2B7FE1"

@@ -70,6 +70,9 @@ class ColorRules:
     allowed_text: list[str] = field(default_factory=list)
     allowed_background: list[str] = field(default_factory=list)
     accent: str | None = None
+    # "whitelist" (default): exact color match
+    # "contrast": check WCAG contrast ratio instead of exact colors
+    text_mode: str = "whitelist"
 
 
 @dataclass
@@ -126,3 +129,4 @@ class CompiledRuleSet:
     """Set of compiled checker functions ready to run against slides."""
 
     checkers: list[Callable] = field(default_factory=list)
+    user_roles: list[str] = field(default_factory=list)  # role names for AI classifier

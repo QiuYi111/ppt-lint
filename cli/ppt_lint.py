@@ -45,6 +45,9 @@ def cli() -> None:
 @click.option("--output-file", type=click.Path(), help="Output fixed file path (with --fix)")
 @click.option("--no-ai", is_flag=True, help="Skip AI rule compilation")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+@click.option("--severity-threshold", "min_severity",
+              type=click.Choice(["error", "warning", "info"]), default="info",
+              help="Minimum severity to report (default: info)")
 def check(
     file: str,
     rules: str,
@@ -55,9 +58,20 @@ def check(
     output_file: str | None,
     no_ai: bool,
     verbose: bool,
+    min_severity: str,
 ) -> None:
     """Check a PowerPoint file against formatting rules."""
     _setup_logging(verbose)
+
+    # Severity filter order: error > warning > info
+    severity_order = {"error": 0, "warning": 1, "info": 2}
+    min_level = severity_order.get(min_severity, 2)
+
+    def _filter_issues(issues):
+        return [
+            i for i in issues
+            if severity_order.get(i.severity.value, 2) >= min_level
+        ]
 
     try:
         rule_set = parse_rules(rules)
@@ -77,6 +91,7 @@ def check(
             compiled,
             output_path=output_file,
             dry_run=dry_run,
+            use_ai=not no_ai,
         )
         if dry_run and result.fixable:
             click.echo(
@@ -84,7 +99,10 @@ def check(
                 err=True,
             )
     else:
-        result = lint_file(file, compiled)
+        result = lint_file(file, compiled, use_ai=not no_ai)
+        # Apply severity filter
+        filtered_issues = _filter_issues(result.issues)
+        result.issues = filtered_issues
 
     if output == "terminal":
         report_terminal(result)

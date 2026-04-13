@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from pptx.dml.color import RGBColor
@@ -89,8 +90,37 @@ def get_text_runs(slide: Any) -> list[dict[str, Any]]:
     return runs
 
 
+def get_slide_background_color(slide: Any) -> str | None:
+    """Get the slide's own background color (not shape fills).
+
+    Returns the hex color of the slide background, or None if
+    the slide uses a transparent/default background.
+    """
+    try:
+        bg = slide.background
+        fill = bg.fill
+        # fill.type is BACKGROUND (5) even when no fill is applied.
+        # Only return a color if there's an actual solid fill.
+        try:
+            if fill.type is not None:
+                color = fill.fore_color
+                if color and color.rgb:
+                    return f"#{color.rgb}"
+        except (TypeError, AttributeError):
+            pass
+    except (AttributeError, TypeError):
+        pass
+    return None
+
+
 def get_shapes_with_fill(slide: Any) -> list[dict[str, Any]]:
-    """Get all shapes with background fill colors."""
+    """Get all shapes with background fill colors.
+
+    DEPRECATED: Use get_slide_background_color() for slide background checks.
+    This function returns decorative shape fills which are typically NOT
+    the slide background color. Kept for backward compatibility but
+    callers should prefer get_slide_background_color().
+    """
     shapes = []
     for si, shape in enumerate(slide.shapes):
         fill_color = None
@@ -125,8 +155,14 @@ def get_slide_number_shapes(slide: Any) -> list[dict[str, Any]]:
         if not shape.has_text_frame:
             continue
         text = shape.text_frame.text.strip()
-        # Slide number detection: numeric text in bottom area
+        # Slide number detection: pure digit, slide_id match, or "N / M" format
+        is_slide_num = False
         if text.isdigit() or text == str(slide.slide_id):
+            is_slide_num = True
+        elif re.match(r"^\d+\s*/\s*\d+$", text):
+            is_slide_num = True
+
+        if is_slide_num:
             candidates.append({
                 "shape_index": si,
                 "shape_name": shape.name,
@@ -140,6 +176,78 @@ def get_slide_number_shapes(slide: Any) -> list[dict[str, Any]]:
                 else None,
             })
     return candidates
+
+
+def extract_slide_summary(slide: Any, slide_index: int) -> dict[str, Any]:
+    """Extract a structured summary of all shapes on a slide for AI classification.
+
+    Returns a dict with slide dimensions and a list of shape descriptors
+    suitable for sending to Claude for role classification.
+    """
+    slide_w = 9144000  # default 10 inches in EMU
+    slide_h = 6858000  # default 7.5 inches
+    try:
+        slide_w = slide.slide_layout.slide_master.slide_width
+        slide_h = slide.slide_layout.slide_master.slide_height
+    except (AttributeError, TypeError):
+        pass
+
+    shapes = []
+    for si, shape in enumerate(slide.shapes):
+        entry: dict[str, Any] = {
+            "index": si,
+            "name": shape.name,
+            "type": str(shape.shape_type),
+            "has_text": shape.has_text_frame,
+        }
+
+        if shape.has_text_frame:
+            tf = shape.text_frame
+            entry["text_preview"] = tf.text[:120]
+            entry["paragraph_count"] = len(tf.paragraphs)
+            # Collect font info from first run
+            if tf.paragraphs and tf.paragraphs[0].runs:
+                first_run = tf.paragraphs[0].runs[0]
+                entry["font_name"] = first_run.font.name
+                entry["font_size_pt"] = (
+                    _emu_to_pt(first_run.font.size) if first_run.font.size else None
+                )
+                entry["bold"] = first_run.font.bold
+                entry["color_hex"] = rgb_to_hex_safe(first_run.font.color)
+            # Max font size across all runs
+            entry["max_font_size_pt"] = _get_max_font_size(shape)
+        else:
+            entry["has_fill"] = False
+            try:
+                if shape.fill and shape.fill.type is not None:
+                    entry["has_fill"] = True
+                    entry["fill_color"] = rgb_to_hex_safe(shape.fill.fore_color)
+            except Exception:
+                pass
+
+        # Position in inches (approximate)
+        if hasattr(shape, "left"):
+            entry["left_in"] = round(float(shape.left) / 914400, 2)
+            entry["top_in"] = round(float(shape.top) / 914400, 2)
+            entry["width_in"] = round(float(shape.width) / 914400, 2)
+            entry["height_in"] = round(float(shape.height) / 914400, 2)
+
+        # Placeholder info
+        if hasattr(shape, "is_placeholder") and shape.is_placeholder:
+            ph_fmt = getattr(shape, "placeholder_format", None)
+            if ph_fmt and hasattr(ph_fmt, "idx"):
+                entry["placeholder_idx"] = ph_fmt.idx
+            if ph_fmt and hasattr(ph_fmt, "type"):
+                entry["placeholder_type"] = str(ph_fmt.type)
+
+        shapes.append(entry)
+
+    return {
+        "slide_index": slide_index,
+        "slide_width_in": round(float(slide_w) / 914400, 2),
+        "slide_height_in": round(float(slide_h) / 914400, 2),
+        "shapes": shapes,
+    }
 
 
 def get_chart_shapes(slide: Any) -> list[dict[str, Any]]:
@@ -163,41 +271,123 @@ def get_chart_shapes(slide: Any) -> list[dict[str, Any]]:
     return charts
 
 
-def classify_text_role(shape: Any, slide: Any) -> str:
-    """Classify a text shape as title, body, caption, or other.
+def classify_text_role(shape: Any, slide: Any, user_roles: set[str] | None = None) -> str:
+    """Classify a text shape into a role.
 
-    Heuristic: uses shape name, position, and size.
+    Uses shape name, placeholder type, position, font size, and content
+    to determine the role. Supports user-defined roles from rules.yaml.
+
+    Built-in roles (matched by heuristic priority):
+      - title, subtitle, section_number, slide_number, footer, caption, body
+
+    If *user_roles* is provided, the classifier will attempt to map shapes
+    to those role names; shapes that don't match any user role fall back to
+    the built-in classification, ultimately defaulting to "body".
+
+    Parameters
+    ----------
+    shape : pptx.shape
+    slide : pptx.slide
+    user_roles : set of role names defined in rules.yaml fonts section
     """
     name = shape.name.lower()
-    # Title placeholders
-    if "title" in name and "subtitle" not in name:
+    text = shape.text_frame.text.strip() if shape.has_text_frame else ""
+
+    # ── 1. Shape name keywords ──────────────────────────
+    if "slide number" in name or "sldnum" in name or "page number" in name:
+        return "slide_number"
+    if "footer" in name:
+        return "footer"
+    if "header" in name:
+        return "footer"  # headers in PPT are typically non-content text
+    if "title" in name and "subtitle" not in name and "section" not in name:
         return "title"
     if "subtitle" in name:
+        if user_roles and "subtitle" in user_roles:
+            return "subtitle"
         return "body"
-    # Check if it's a placeholder
+    if "section" in name or "divider" in name or "separator" in name:
+        return "section_number"
+
+    # ── 2. Placeholder index ────────────────────────────
     if hasattr(shape, "is_placeholder") and shape.is_placeholder:
-        ph_idx = getattr(shape, "placeholder_format", None)
-        if ph_idx and hasattr(ph_idx, "idx"):
-            # Index 0 = title, 1 = body/subtitle
-            if ph_idx.idx == 0:
+        ph_fmt = getattr(shape, "placeholder_format", None)
+        if ph_fmt and hasattr(ph_fmt, "idx"):
+            idx = ph_fmt.idx
+            if idx == 0:
                 return "title"
-            return "body"
-    # Size heuristic: large text near top = title
-    if hasattr(shape, "top") and shape.top is not None:
-        if shape.top < Emu(1143000):  # < ~1 inch from top
+            if idx == 1:
+                # idx 1 is typically the body/subtitle placeholder.
+                # Return "subtitle" if the user defined that role, else "body".
+                if user_roles and "subtitle" in user_roles:
+                    return "subtitle"
+                return "body"
+            if idx >= 10:
+                # Standard PPTX: idx 10+ = date, slide number, footer, etc.
+                if text.isdigit() or re.match(r"^\d+\s*/\s*\d+$", text):
+                    return "slide_number"
+                return "footer"
+
+    # ── 3. Content-based heuristics ─────────────────────
+    slide_height = Emu(6858000)  # default 7.5 inches
+    try:
+        slide_height = slide.slide_layout.slide_master.slide_height
+    except (AttributeError, TypeError):
+        pass
+
+    shape_top = shape.top if hasattr(shape, "top") and shape.top is not None else Emu(0)
+
+    # 3a. Slide number pattern: pure digit or "N / M" format
+    if re.match(r"^\d+\s*/\s*\d+$", text):
+        return "slide_number"
+    if text.isdigit():
+        # Only treat as slide_number if it's short and likely a number
+        if len(text) <= 4:
+            return "slide_number"
+
+    # 3b. Very large font → section_number (≥ 40pt, usually decorative)
+    max_font_size = _get_max_font_size(shape)
+    if max_font_size is not None and max_font_size >= 40:
+        return "section_number"
+
+    # 3c. Bottom area + small text → footer
+    bottom_threshold = slide_height - Emu(914400)  # bottom 1 inch
+    if shape_top >= bottom_threshold:
+        if max_font_size is not None and max_font_size <= 12:
+            return "footer"
+        if not text:  # empty text box in footer area
+            return "footer"
+
+    # 3d. Top area: distinguish title vs header
+    top_threshold = Emu(1143000)  # ~1 inch
+    if shape_top < top_threshold:
+        # Only classify as title if font is reasonably large (> 14pt)
+        # Small text at top is likely a header, not a title
+        if max_font_size is not None and max_font_size > 14:
             return "title"
-    # Small font = caption
-    if shape.has_text_frame and shape.text_frame.paragraphs:
-        first_para = shape.text_frame.paragraphs[0]
-        if first_para.runs:
-            font_size = (
-                _emu_to_pt(first_para.runs[0].font.size)
-                if first_para.runs[0].font.size
-                else None
-            )
-            if font_size and font_size <= 11:
-                return "caption"
+        # Small text at top → likely header/footer
+        return "footer"
+
+    # 3e. Small font → caption (≤ 11pt)
+    if max_font_size is not None and max_font_size <= 11:
+        return "caption"
+
+    # ── 4. Fallback: body ───────────────────────────────
     return "body"
+
+
+def _get_max_font_size(shape: Any) -> float | None:
+    """Get the maximum font size (in pt) across all runs in a shape."""
+    if not shape.has_text_frame:
+        return None
+    max_size = None
+    for para in shape.text_frame.paragraphs:
+        for run in para.runs:
+            if run.font.size:
+                pt = _emu_to_pt(run.font.size)
+                if pt is not None:
+                    max_size = pt if max_size is None else max(max_size, pt)
+    return max_size
 
 
 def apply_font_fix(run: Any, family: str | None = None, size_pt: float | None = None,
