@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(".ppt-lint-cache/roles")
 
-# Claude CLI config
-_CLAUDE_CMD = "claude"
-_CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# Claude CLI config (claude-glm = Claude Code with GLM/OpenAI backend)
+_CLAUDE_CMD = "claude-glm"
+_CLAUDE_MODEL = ""  # empty = use claude-glm's default model (opus)
 _CLAUDE_TIMEOUT = 120  # seconds per call
 
 
@@ -211,15 +211,19 @@ def _classify_batch(
     )
 
     try:
+        cmd = [
+            _CLAUDE_CMD, "--print",
+            "--bare",
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+            prompt,
+        ]
+        if _CLAUDE_MODEL:
+            cmd.insert(cmd.index("--bare") + 1, "--model")
+            cmd.insert(cmd.index("--bare") + 2, _CLAUDE_MODEL)
+
         result = subprocess.run(
-            [
-                _CLAUDE_CMD, "--print",
-                "--bare",
-                "--model", _CLAUDE_MODEL,
-                "--output-format", "json",
-                "--dangerously-skip-permissions",
-                prompt,
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=_CLAUDE_TIMEOUT,
@@ -364,15 +368,19 @@ def _classify_via_claude(
     )
 
     try:
+        cmd = [
+            _CLAUDE_CMD, "--print",
+            "--bare",
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+            prompt,
+        ]
+        if _CLAUDE_MODEL:
+            cmd.insert(cmd.index("--bare") + 1, "--model")
+            cmd.insert(cmd.index("--bare") + 2, _CLAUDE_MODEL)
+
         result = subprocess.run(
-            [
-                _CLAUDE_CMD, "--print",
-                "--bare",
-                "--model", _CLAUDE_MODEL,
-                "--output-format", "json",
-                "--dangerously-skip-permissions",
-                prompt,
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=_CLAUDE_TIMEOUT,
