@@ -5,10 +5,10 @@ Update this file as work progresses.
 
 ## Current State
 
-- Status: AI-powered role classification implemented, ready for validation
-- Last updated: 2026-04-12
+- Status: Using claude-glm (local Claude Code) for AI role classification
+- Last updated: 2026-04-13
 - Branch: feat/ppt-lint-core
-- Latest commit: 83160f4
+- Latest commit: 0cfe4cc
 
 ## Key Findings
 
@@ -37,12 +37,13 @@ Update this file as work progresses.
 
 ## Claude CLI Integration (role_classifier.py)
 
-- `claude --print --bare --model claude-sonnet-4-20250514 --output-format json --dangerously-skip-permissions`
+- **CLI:** `claude-glm` (local Claude Code instance, default model: opus)
+- `claude-glm --print --bare --output-format json --dangerously-skip-permissions`
 - `--bare` mode reduces system prompt (~44K vs 64K without)
-- Cost: ~$0.015/slide with cache read, ~$0.20 cold (first call)
-- Timeout: 45s per slide
+- No hardcoded model — uses claude-glm's default (can override via _CLAUDE_MODEL)
+- Timeout: 120s per batch call
 - Response parsing: `{"type": "result", "result": "<json>"}` — strips markdown fences
-- Fallback: heuristic classifier when Claude unavailable or times out
+- Fallback: heuristic classifier when claude-glm unavailable or times out
 - `--no-ai` flag disables AI entirely (tests, CI, offline use)
 
 ## Test Results
