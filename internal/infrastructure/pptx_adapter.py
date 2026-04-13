@@ -99,8 +99,15 @@ def get_slide_background_color(slide: Any) -> str | None:
     try:
         bg = slide.background
         fill = bg.fill
-        if fill.type is not None:
-            return rgb_to_hex_safe(fill.fore_color)
+        # fill.type is BACKGROUND (5) even when no fill is applied.
+        # Only return a color if there's an actual solid fill.
+        try:
+            if fill.type is not None:
+                color = fill.fore_color
+                if color and color.rgb:
+                    return f"#{color.rgb}"
+        except (TypeError, AttributeError):
+            pass
     except (AttributeError, TypeError):
         pass
     return None

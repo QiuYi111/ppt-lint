@@ -70,6 +70,9 @@ class ColorRules:
     allowed_text: list[str] = field(default_factory=list)
     allowed_background: list[str] = field(default_factory=list)
     accent: str | None = None
+    # "whitelist" (default): exact color match
+    # "contrast": check WCAG contrast ratio instead of exact colors
+    text_mode: str = "whitelist"
 
 
 @dataclass

@@ -1,8 +1,12 @@
-"""AI-powered text role classifier using Claude CLI.
+"""AI-powered text role classifier via Anthropic-compatible API.
 
-Instead of brittle heuristics, sends slide shape metadata to Claude
-for intelligent role classification. Supports two modes:
-  - Batch (default): all slides classified in one Claude call
+Instead of brittle heuristics, sends slide shape metadata to an LLM
+for intelligent role classification. Uses direct HTTP calls to an
+Anthropic-compatible API (e.g. Z.AI proxy) instead of Claude CLI,
+which has compatibility issues with some proxy backends.
+
+Supports two modes:
+  - Batch (default): all slides classified in one API call
   - Per-slide fallback: one call per slide (for cache hits / retries)
 
 Results are cached per slide content hash.
@@ -13,8 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import shutil
-import subprocess
+import os
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -26,10 +32,119 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(".ppt-lint-cache/roles")
 
-# Claude CLI config (claude-glm = Claude Code with GLM/OpenAI backend)
-_CLAUDE_CMD = "claude-glm"
-_CLAUDE_MODEL = ""  # empty = use claude-glm's default model (opus)
-_CLAUDE_TIMEOUT = 120  # seconds per call
+# API config — reads from env vars with sensible defaults
+_API_BASE_URL = os.environ.get(
+    "PPT_LINT_API_BASE_URL",
+    os.environ.get("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic"),
+)
+_API_KEY = os.environ.get(
+    "PPT_LINT_API_KEY",
+    os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
+)
+_API_MODEL = os.environ.get(
+    "PPT_LINT_MODEL",
+    os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL", "glm-5.1"),
+)
+_API_TIMEOUT = int(os.environ.get("PPT_LINT_API_TIMEOUT", "120"))
+
+# Proxy settings (inherit from env)
+_HTTP_PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY", "")
+
+
+def _get_opener() -> urllib.request.OpenerDirector:
+    """Build URL opener, optionally with proxy."""
+    if _HTTP_PROXY:
+        proxy = urllib.request.ProxyHandler({
+            "https": _HTTP_PROXY,
+            "http": _HTTP_PROXY,
+        })
+        return urllib.request.build_opener(proxy)
+    return urllib.request.build_opener()
+
+
+def _call_api(prompt: str, max_tokens: int = 4096) -> str | None:
+    """Send a prompt to the Anthropic-compatible API and return the text response.
+
+    Returns None on any error (timeout, HTTP error, parse error).
+    Retries once on 429 (rate limit) with a 5s backoff.
+    """
+    url = f"{_API_BASE_URL.rstrip('/')}/v1/messages"
+    payload = json.dumps({
+        "model": _API_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "x-api-key": _API_KEY,
+        "anthropic-version": "2023-06-01",
+    })
+
+    opener = _get_opener()
+
+    for attempt in range(2):
+        try:
+            resp = opener.open(req, timeout=_API_TIMEOUT)
+            data = json.loads(resp.read().decode())
+            # Extract text from Anthropic response format
+            blocks = data.get("content", [])
+            for block in blocks:
+                if block.get("type") == "text":
+                    return block["text"]
+            return None
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                retry_after = e.headers.get("retry-after")
+                wait = int(retry_after) if retry_after else 5
+                logger.warning(f"API rate limited, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            body = e.read().decode()[:300] if hasattr(e, "read") else ""
+            logger.warning(f"API HTTP {e.code}: {body}")
+            return None
+
+        except urllib.error.URLError as e:
+            logger.warning(f"API connection error: {e.reason}")
+            return None
+        except TimeoutError:
+            logger.warning(f"API timed out ({_API_TIMEOUT}s)")
+            return None
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"API response parse error: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"API call error: {e}")
+            return None
+
+    return None
+
+
+def _api_available() -> bool:
+    """Check if API key is configured."""
+    return bool(_API_KEY)
+
+
+def _parse_json_response(content: str) -> dict[str, Any] | None:
+    """Parse JSON from LLM response, stripping markdown fences if present."""
+    if not content:
+        return None
+
+    # Strip markdown fences
+    if "```" in content:
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+        content = content.strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+
+# ─── Public API ─────────────────────────────────────────────────────────
 
 
 def classify_all_slides(
@@ -44,15 +159,15 @@ def classify_all_slides(
     n_slides = len(prs.slides)
     result: dict[int, dict[int, str]] = {}
 
-    if not use_ai or not _claude_available():
+    if not use_ai or not _api_available():
+        logger.info("AI disabled or no API key — using heuristic classifier")
         for i, slide in enumerate(prs.slides):
             result[i] = _classify_heuristic(slide, user_roles)
         return result
 
-    # Try batch mode first: one Claude call for all slides
+    # Try batch mode first: one API call for all slides
     batch_result = _classify_batch(prs, user_roles)
     if batch_result is not None:
-        # Fill in any slides that batch missed (e.g. no text shapes)
         for i in range(n_slides):
             if i in batch_result:
                 result[i] = batch_result[i]
@@ -92,15 +207,18 @@ def classify_slide_roles(
         logger.debug(f"Role cache hit for slide {slide_index}")
         return cached
 
-    result = _classify_via_claude(slide, slide_index, user_roles)
+    result = _classify_slide_via_api(slide, slide_index, user_roles)
     if result is not None:
         return result
 
     logger.info(
-        "Claude CLI unavailable, falling back to heuristic "
+        "API unavailable, falling back to heuristic "
         f"classifier for slide {slide_index}"
     )
     return _classify_heuristic(slide, user_roles)
+
+
+# ─── Heuristic classifier ───────────────────────────────────────────────
 
 
 def _classify_heuristic(
@@ -114,16 +232,14 @@ def _classify_heuristic(
     return roles
 
 
-def _claude_available() -> bool:
-    """Check if claude CLI is available."""
-    return shutil.which(_CLAUDE_CMD) is not None
+# ─── Batch classification ───────────────────────────────────────────────
 
 
 def _classify_batch(
     prs: Presentation,
     user_roles: set[str] | None = None,
 ) -> dict[int, dict[int, str]] | None:
-    """Classify all slides in one Claude call. Much faster than per-slide."""
+    """Classify all slides in one API call. Much faster than per-slide."""
     roles_list = sorted(user_roles) if user_roles else [
         "title", "subtitle", "body", "caption",
         "section_number", "section_title", "slide_number", "footer",
@@ -210,111 +326,70 @@ def _classify_batch(
         "No explanation. No markdown fences."
     )
 
-    try:
-        cmd = [
-            _CLAUDE_CMD, "--print",
-            "--bare",
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-            prompt,
-        ]
-        if _CLAUDE_MODEL:
-            cmd.insert(cmd.index("--bare") + 1, "--model")
-            cmd.insert(cmd.index("--bare") + 2, _CLAUDE_MODEL)
+    content = _call_api(prompt, max_tokens=4096)
+    if content is None:
+        return None
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=_CLAUDE_TIMEOUT,
-        )
+    batch_map = _parse_json_response(content)
+    if batch_map is None:
+        logger.warning("Failed to parse batch classification response")
+        return None
 
-        if result.returncode != 0:
-            logger.warning(f"Claude CLI batch failed: {result.stderr[:300]}")
-            return None
+    # Parse and cache per-slide results
+    all_result: dict[int, dict[int, str]] = {}
 
-        output = json.loads(result.stdout)
-        content = output.get("result", "")
+    # Fill cached slides first
+    for i in slides_with_text:
+        summary = extract_slide_summary(prs.slides[i], i)
+        text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+        cache_key = _slide_content_hash(text_shapes, user_roles)
+        cached = _load_cache(cache_key)
+        if cached is not None:
+            all_result[i] = cached
 
-        if output.get("subtype") == "error_max_budget_usd":
-            logger.warning("Claude batch: budget exceeded")
-            return None
-
-        if not content:
-            logger.warning("Claude batch: empty response")
-            return None
-
-        # Strip markdown fences
-        if "```" in content:
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-
-        batch_map: dict[str, dict[str, str]] = json.loads(content)
-
-        # Parse and cache per-slide results
-        all_result: dict[int, dict[int, str]] = {}
-
-        # Fill cached slides first
-        for i in slides_with_text:
-            summary = extract_slide_summary(prs.slides[i], i)
-            text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
-            cache_key = _slide_content_hash(text_shapes, user_roles)
-            cached = _load_cache(cache_key)
-            if cached is not None:
-                all_result[i] = cached
-
-        # Fill batch results
-        roles_set = set(roles_list)
-        for slide_key, shape_roles in batch_map.items():
+    # Fill batch results
+    roles_set = set(roles_list)
+    for slide_key, shape_roles in batch_map.items():
+        try:
+            si = int(slide_key)
+        except (ValueError, TypeError):
+            continue
+        parsed: dict[int, str] = {}
+        for shape_key, role in shape_roles.items():
             try:
-                si = int(slide_key)
+                idx = int(shape_key)
             except (ValueError, TypeError):
                 continue
-            parsed: dict[int, str] = {}
-            for shape_key, role in shape_roles.items():
-                try:
-                    idx = int(shape_key)
-                except (ValueError, TypeError):
-                    continue
-                if role in roles_set:
-                    parsed[idx] = role
-                else:
-                    parsed[idx] = "body"
-            all_result[si] = parsed
-            # Cache this slide
-            summary = extract_slide_summary(prs.slides[si], si)
-            text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
-            cache_key = _slide_content_hash(text_shapes, user_roles)
-            _save_cache(cache_key, parsed)
+            if role in roles_set:
+                parsed[idx] = role
+            else:
+                parsed[idx] = "body"
+        all_result[si] = parsed
+        # Cache this slide
+        summary = extract_slide_summary(prs.slides[si], si)
+        text_shapes = [s for s in summary["shapes"] if s.get("has_text")]
+        cache_key = _slide_content_hash(text_shapes, user_roles)
+        _save_cache(cache_key, parsed)
 
-        classified_slides = len(all_result)
-        classified_shapes = sum(len(v) for v in all_result.values())
-        logger.info(
-            f"Claude batch: classified {classified_shapes} shapes "
-            f"across {classified_slides} slides"
-        )
-        return all_result
-
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Claude batch timed out ({_CLAUDE_TIMEOUT}s)")
-        return None
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(f"Claude batch parse error: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"Claude batch error: {e}")
-        return None
+    classified_slides = len(all_result)
+    classified_shapes = sum(len(v) for v in all_result.values())
+    logger.info(
+        f"API batch: classified {classified_shapes} shapes "
+        f"across {classified_slides} slides"
+    )
+    return all_result
 
 
-def _classify_via_claude(
+# ─── Per-slide classification ───────────────────────────────────────────
+
+
+def _classify_slide_via_api(
     slide: Any,
     slide_index: int,
     user_roles: set[str] | None = None,
 ) -> dict[int, str] | None:
-    """Classify shapes on a single slide using Claude CLI (per-slide fallback)."""
-    if not _claude_available():
+    """Classify shapes on a single slide via API (per-slide fallback)."""
+    if not _api_available():
         return None
 
     summary = extract_slide_summary(slide, slide_index)
@@ -367,73 +442,30 @@ def _classify_via_claude(
         "No explanation, no fences."
     )
 
-    try:
-        cmd = [
-            _CLAUDE_CMD, "--print",
-            "--bare",
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-            prompt,
-        ]
-        if _CLAUDE_MODEL:
-            cmd.insert(cmd.index("--bare") + 1, "--model")
-            cmd.insert(cmd.index("--bare") + 2, _CLAUDE_MODEL)
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=_CLAUDE_TIMEOUT,
-        )
-
-        if result.returncode != 0:
-            logger.warning(
-                f"Claude CLI failed for slide {slide_index}: "
-                f"{result.stderr[:200]}"
-            )
-            return None
-
-        output = json.loads(result.stdout)
-        content = output.get("result", "")
-
-        if output.get("subtype") == "error_max_budget_usd":
-            return None
-        if not content:
-            return None
-
-        if "```" in content:
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-
-        role_map = json.loads(content)
-
-        parsed: dict[int, str] = {}
-        roles_set = set(roles_list)
-        for k, v in role_map.items():
-            try:
-                idx = int(k)
-                parsed[idx] = v if v in roles_set else "body"
-            except (ValueError, TypeError):
-                continue
-
-        _save_cache(cache_key, parsed)
-        logger.info(f"Claude classified {len(parsed)} shapes on slide {slide_index}")
-        return parsed
-
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Claude CLI timed out for slide {slide_index}")
+    content = _call_api(prompt, max_tokens=1024)
+    if content is None:
         return None
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(f"Parse error for slide {slide_index}: {e}")
+
+    role_map = _parse_json_response(content)
+    if role_map is None:
+        logger.warning(f"Failed to parse API response for slide {slide_index}")
         return None
-    except FileNotFoundError:
-        logger.warning("claude CLI not found")
-        return None
-    except Exception as e:
-        logger.warning(f"Claude error for slide {slide_index}: {e}")
-        return None
+
+    parsed: dict[int, str] = {}
+    roles_set = set(roles_list)
+    for k, v in role_map.items():
+        try:
+            idx = int(k)
+            parsed[idx] = v if v in roles_set else "body"
+        except (ValueError, TypeError):
+            continue
+
+    _save_cache(cache_key, parsed)
+    logger.info(f"API classified {len(parsed)} shapes on slide {slide_index}")
+    return parsed
+
+
+# ─── Cache ──────────────────────────────────────────────────────────────
 
 
 def _slide_content_hash(

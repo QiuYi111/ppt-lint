@@ -167,7 +167,7 @@ def _compile_color_rules(rules: RuleSet) -> list[Callable]:
     checkers = []
     cr = rules.colors
     if cr.allowed_text:
-        checkers.append(_make_text_color_checker(cr.allowed_text))
+        checkers.append(_make_text_color_checker(cr.allowed_text, cr.text_mode))
     if cr.allowed_background:
         checkers.append(_make_bg_color_checker(cr.allowed_background))
     if cr.accent:
@@ -175,31 +175,86 @@ def _compile_color_rules(rules: RuleSet) -> list[Callable]:
     return checkers
 
 
-def _make_text_color_checker(allowed: list[str]) -> Callable:
+def _make_text_color_checker(allowed: list[str], mode: str = "whitelist") -> Callable:
     allowed_upper = {c.upper().lstrip("#") for c in allowed}
 
     def check(
         slide: Any, slide_index: int, role_map: dict[int, str] | None = None,
     ) -> list[LintIssue]:
         issues = []
-        for run_info in get_text_runs(slide):
-            color_hex = run_info["color_hex"]
-            if not color_hex:
-                continue
-            color_clean = color_hex.upper().lstrip("#")
-            if color_clean not in allowed_upper:
-                desc = f"文字 \"{run_info['text'][:20]}\""
-                issues.append(LintIssue(
-                    rule_id="colors.allowed_text",
-                    severity=Severity.WARNING,
-                    slide_index=slide_index,
-                    element_desc=desc,
-                    message=f"文字颜色 '{color_hex}' 不在允许列表中",
-                    fix=None,
-                ))
+
+        if mode == "contrast":
+            # Contrast mode: check WCAG contrast ratio against slide background
+            bg_color = get_slide_background_color(slide)
+            # Default to white if no explicit background
+            bg_rgb = _hex_to_rgb_tuple(bg_color) if bg_color else (255, 255, 255)
+
+            for run_info in get_text_runs(slide):
+                color_hex = run_info["color_hex"]
+                if not color_hex:
+                    continue
+                text_rgb = _hex_to_rgb_tuple(color_hex)
+                if text_rgb is None:
+                    continue
+                ratio = _contrast_ratio(bg_rgb, text_rgb)
+                if ratio < 4.5:
+                    desc = f"文字 \"{run_info['text'][:20]}\""
+                    issues.append(LintIssue(
+                        rule_id="colors.contrast",
+                        severity=Severity.WARNING,
+                        slide_index=slide_index,
+                        element_desc=desc,
+                        message=f"文字与背景对比度不足 ({ratio:.1f}:1，建议 ≥ 4.5:1)",
+                        fix=None,
+                    ))
+        else:
+            # Whitelist mode: exact color match
+            for run_info in get_text_runs(slide):
+                color_hex = run_info["color_hex"]
+                if not color_hex:
+                    continue
+                color_clean = color_hex.upper().lstrip("#")
+                if color_clean not in allowed_upper:
+                    desc = f"文字 \"{run_info['text'][:20]}\""
+                    issues.append(LintIssue(
+                        rule_id="colors.allowed_text",
+                        severity=Severity.WARNING,
+                        slide_index=slide_index,
+                        element_desc=desc,
+                        message=f"文字颜色 '{color_hex}' 不在允许列表中",
+                        fix=None,
+                    ))
         return issues
 
     return check
+
+
+def _hex_to_rgb_tuple(hex_str: str) -> tuple[int, int, int] | None:
+    """Convert '#1F2D3D' to (31, 45, 61)."""
+    try:
+        h = hex_str.lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except (ValueError, IndexError):
+        return None
+
+
+def _luminance(r: int, g: int, b: int) -> float:
+    """Calculate relative luminance per WCAG 2.0."""
+    def _linearize(c: int) -> float:
+        s = c / 255.0
+        return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
+    return 0.2126 * _linearize(r) + 0.7152 * _linearize(g) + 0.0722 * _linearize(b)
+
+
+def _contrast_ratio(
+    rgb1: tuple[int, int, int], rgb2: tuple[int, int, int],
+) -> float:
+    """Calculate WCAG contrast ratio between two RGB colors."""
+    l1 = _luminance(*rgb1)
+    l2 = _luminance(*rgb2)
+    lighter = max(l1, l2)
+    darker = min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 def _make_bg_color_checker(allowed: list[str]) -> Callable:

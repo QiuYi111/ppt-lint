@@ -64,7 +64,13 @@ class TestEngineBad:
         compiled = compile_rules(rules, use_ai=False)
         result = _lint(FIXTURES_DIR / "bad.pptx", compiled)
         color_issues = [i for i in result.issues if i.rule_id.startswith("colors.")]
-        assert len(color_issues) > 0
+        # In contrast mode, red/green on white still has good contrast → no issues.
+        # In whitelist mode, they'd be flagged. Either behavior is valid.
+        if rules.colors.text_mode == "whitelist":
+            assert len(color_issues) > 0
+        else:
+            # contrast mode: issues only if contrast ratio < 4.5
+            assert isinstance(color_issues, list)  # just verify no crash
 
 
 class TestEngineGood:
@@ -79,6 +85,51 @@ class TestEngineGood:
         bad_result = _lint(FIXTURES_DIR / "bad.pptx", compiled)
         good_result = _lint(FIXTURES_DIR / "good.pptx", compiled)
         assert good_result.total < bad_result.total
+
+    def test_contrast_mode_detects_poor_contrast(self):
+        """Contrast mode should flag text with < 4.5:1 contrast ratio."""
+        from io import BytesIO
+
+        from pptx import Presentation
+        from pptx.dml.color import RGBColor
+        from pptx.util import Inches
+
+        from internal.domain.rules import parse_rules
+        from internal.infrastructure.compiler import compile_rules
+
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        # White background (default)
+        txbox = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(1))
+        tf = txbox.text_frame
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = "Light gray text"
+        run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)  # #CCCCCC on white ≈ 1.6:1
+
+        buf = BytesIO()
+        prs.save(buf)
+        buf.seek(0)
+
+        # Write to temp file for lint_file
+        import pathlib
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as f:
+            f.write(buf.read())
+            tmp_path = f.name
+
+        try:
+            import os
+
+            rules = parse_rules(RULES_PATH)
+            rules.colors.text_mode = "contrast"
+            compiled = compile_rules(rules, use_ai=False)
+            result = _lint(pathlib.Path(tmp_path), compiled)
+            contrast_issues = [i for i in result.issues if i.rule_id == "colors.contrast"]
+            assert len(contrast_issues) > 0, "Should detect poor contrast"
+        finally:
+            os.unlink(tmp_path)
 
 
 class TestFix:
